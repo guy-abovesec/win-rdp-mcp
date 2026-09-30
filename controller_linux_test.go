@@ -168,3 +168,100 @@ func waitExit(t *testing.T, c *rdpClient) {
 		t.Fatal("client did not exit")
 	}
 }
+
+func TestXdotoolCombo(t *testing.T) {
+	cases := map[string]string{
+		"ctrl+c":         "ctrl+c",
+		"ctrl+shift+esc": "ctrl+shift+Escape",
+		"win+e":          "super+e",
+		"alt+F4":         "alt+F4",
+		"alt+f4":         "alt+F4",
+		"F12":            "F12",
+		"f24":            "F24",
+		"f25":            "f25", // not a function key: passed through, xdotool rejects it
+		"f04":            "f04",
+		"CTRL+A":         "ctrl+a",
+		" ctrl + c ":     "ctrl+c",
+		"capslock":       "Caps_Lock",
+		"KP_Enter":       "KP_Enter",
+		"volumeup":       "XF86AudioRaiseVolume",
+		"ctrl++":         "ctrl",
+		"":               "",
+	}
+	for in, want := range cases {
+		if got := xdotoolCombo(in); got != want {
+			t.Errorf("xdotoolCombo(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestXdotoolKeyNamesCoverTheAgentsNames(t *testing.T) {
+	// Every key name the agent accepts (namedKeys in platform_windows.go) must
+	// mean something here too. Kept as a literal because that file only builds
+	// on Windows.
+	agent := []string{
+		"ctrl", "control", "alt", "shift", "win", "super", "cmd", "meta",
+		"tab", "enter", "return", "esc", "escape", "space", "backspace", "delete", "del",
+		"insert", "home", "end", "pageup", "pagedown", "up", "down", "left", "right",
+		"capslock", "printscreen", "numlock", "volumemute", "volumedown", "volumeup",
+	}
+	for _, k := range agent {
+		if xdotoolKeyNames[k] == "" {
+			t.Errorf("agent key %q has no xdotool mapping", k)
+		}
+	}
+}
+
+func TestTypingSteps(t *testing.T) {
+	type s = typingStep
+	cases := []struct {
+		in   string
+		want []typingStep
+	}{
+		{"", nil},
+		{"hello", []s{{text: "hello"}}},
+		{"a\nb", []s{{text: "a"}, {key: "Return"}, {text: "b"}}},
+		{"a\r\nb", []s{{text: "a"}, {key: "Return"}, {text: "b"}}},
+		{"a\rb", []s{{text: "a"}, {key: "Return"}, {text: "b"}}},
+		{"x\ty", []s{{text: "x"}, {key: "Tab"}, {text: "y"}}},
+		{"\n\n", []s{{key: "Return"}, {key: "Return"}}},
+		{"end\n", []s{{text: "end"}, {key: "Return"}}},
+		{"héllo ✓ @#$%^&*()", []s{{text: "héllo ✓ @#$%^&*()"}}},
+	}
+	for _, c := range cases {
+		if got := typingSteps(c.in); !slices.Equal(got, c.want) {
+			t.Errorf("typingSteps(%q) = %+v, want %+v", c.in, got, c.want)
+		}
+	}
+}
+
+func TestGlideArgs(t *testing.T) {
+	got := glideArgs(0, 0, 30, 60, 3)
+	want := []string{
+		"mousemove", "10", "20",
+		"sleep", "0.01", "mousemove", "20", "40",
+		"sleep", "0.01", "mousemove", "30", "60",
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("glideArgs = %q, want %q", got, want)
+	}
+	// Moving up-left, with steps that do not divide the distance, still ends
+	// exactly on the target.
+	got = glideArgs(100, 100, 7, 3, 7)
+	if tail := got[len(got)-3:]; !slices.Equal(tail, []string{"mousemove", "7", "3"}) {
+		t.Fatalf("last step = %q, want the target", tail)
+	}
+	if moves := strings.Count(strings.Join(got, " "), "mousemove"); moves != 7 {
+		t.Fatalf("%d mousemoves, want 7", moves)
+	}
+}
+
+func TestParseMouseLocation(t *testing.T) {
+	x, y, err := parseMouseLocation("X=640\nY=400\nSCREEN=0\nWINDOW=543\n")
+	if err != nil || x != 640 || y != 400 {
+		t.Fatalf("got %d,%d,%v", x, y, err)
+	}
+	if _, _, err := parseMouseLocation("garbage"); err == nil {
+		t.Fatal("no error for output without X/Y")
+	}
+}

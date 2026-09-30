@@ -590,6 +590,11 @@ func (s *rdpSession) xdo(args ...string) (string, error) {
 	if err := cmd.Run(); err != nil {
 		return out.String(), fmt.Errorf("xdotool %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(errb.String()))
 	}
+	// xdotool skips a key name it does not know with a warning and exit 0, so a
+	// bad key would otherwise report success having pressed nothing.
+	if msg := errb.String(); strings.Contains(msg, "No such key name") {
+		return out.String(), fmt.Errorf("xdotool %s: %s", strings.Join(args, " "), strings.TrimSpace(firstLine(msg)))
+	}
 	return out.String(), nil
 }
 
@@ -683,13 +688,20 @@ func (s *rdpSession) typeText(ctx context.Context, args arguments) (toolResult, 
 		if _, err := s.xdo("mousemove", itoa(x), itoa(y), "click", "1"); err != nil {
 			return toolResult{}, err
 		}
+		sleepCtx(ctx, 100*time.Millisecond) // let focus land, as the agent does
 	}
 	if args.boolOr("clear", false) {
 		s.xdo("key", "ctrl+a")
 		s.xdo("key", "Delete")
 	}
-	if text != "" {
-		if _, err := s.xdo("type", "--", text); err != nil {
+	for _, step := range typingSteps(text) {
+		var err error
+		if step.key != "" {
+			_, err = s.xdo("key", step.key)
+		} else {
+			_, err = s.xdo("type", "--", step.text)
+		}
+		if err != nil {
 			return toolResult{}, err
 		}
 	}
@@ -699,6 +711,38 @@ func (s *rdpSession) typeText(ctx context.Context, args arguments) (toolResult, 
 	return textResult("Typed %d characters", len([]rune(text))), nil
 }
 
+// typingStep is a run of text for xdotool type, or one key for xdotool key.
+type typingStep struct{ text, key string }
+
+// typingSteps splits text so line breaks and tabs are sent as Return and Tab
+// key presses. Left to xdotool type, a newline becomes the Linefeed keysym,
+// which has no RDP scancode: FreeRDP drops it and multi-line text arrives
+// joined into one line.
+func typingSteps(text string) []typingStep {
+	var steps []typingStep
+	var run strings.Builder
+	flush := func() {
+		if run.Len() > 0 {
+			steps = append(steps, typingStep{text: run.String()})
+			run.Reset()
+		}
+	}
+	for _, r := range strings.ReplaceAll(text, "\r\n", "\n") {
+		switch r {
+		case '\n', '\r':
+			flush()
+			steps = append(steps, typingStep{key: "Return"})
+		case '\t':
+			flush()
+			steps = append(steps, typingStep{key: "Tab"})
+		default:
+			run.WriteRune(r)
+		}
+	}
+	flush()
+	return steps
+}
+
 func (s *rdpSession) move(ctx context.Context, args arguments) (toolResult, error) {
 	x, y := args.intOr("x", 0), args.intOr("y", 0)
 	s.mu.Lock()
@@ -706,20 +750,95 @@ func (s *rdpSession) move(ctx context.Context, args arguments) (toolResult, erro
 	if err := s.ensureConnected(ctx); err != nil {
 		return toolResult{}, err
 	}
+	duration := time.Duration(args.floatOr("duration", 0.3) * float64(time.Second))
 	if args.boolOr("drag", false) {
 		sx, sy := args.intOr("start_x", 0), args.intOr("start_y", 0)
 		if sx != 0 || sy != 0 {
-			s.xdo("mousemove", itoa(sx), itoa(sy))
+			if _, err := s.xdo("mousemove", itoa(sx), itoa(sy)); err != nil {
+				return toolResult{}, err
+			}
 		}
-		s.xdo("mousedown", "1")
-		s.xdo("mousemove", itoa(x), itoa(y))
-		s.xdo("mouseup", "1")
+		if _, err := s.xdo("mousedown", "1"); err != nil {
+			return toolResult{}, err
+		}
+		// Release the button even if the move fails part-way, so a failed drag
+		// does not leave the desktop stuck in a selection.
+		moveErr := s.glide(x, y, duration)
+		_, upErr := s.xdo("mouseup", "1")
+		if err := errors.Join(moveErr, upErr); err != nil {
+			return toolResult{}, err
+		}
 		return textResult("Dragged to (%d,%d)", x, y), nil
 	}
-	if _, err := s.xdo("mousemove", itoa(x), itoa(y)); err != nil {
+	if err := s.glide(x, y, duration); err != nil {
 		return toolResult{}, err
 	}
 	return textResult("Moved to (%d,%d)", x, y), nil
+}
+
+// moveStepInterval is the agent's mouseMove cadence: one pointer update every
+// 10ms, so apps that track hover or drag gestures see the path, not a jump.
+const moveStepInterval = 10 * time.Millisecond
+
+// glide walks the pointer from where it is to (x, y) over duration, in a single
+// chained xdotool call; a zero duration jumps straight there.
+func (s *rdpSession) glide(x, y int, duration time.Duration) error {
+	steps := int(duration / moveStepInterval)
+	if steps < 1 {
+		_, err := s.xdo("mousemove", itoa(x), itoa(y))
+		return err
+	}
+	out, err := s.xdo("getmouselocation", "--shell")
+	if err != nil {
+		return err
+	}
+	startX, startY, err := parseMouseLocation(out)
+	if err != nil {
+		return err
+	}
+	_, err = s.xdo(glideArgs(startX, startY, x, y, steps)...)
+	return err
+}
+
+// glideArgs chains steps evenly spaced xdotool mousemoves from (fromX, fromY)
+// to (x, y), moveStepInterval apart, ending exactly on the target.
+func glideArgs(fromX, fromY, x, y, steps int) []string {
+	pause := strconv.FormatFloat(moveStepInterval.Seconds(), 'f', -1, 64)
+	args := make([]string, 0, steps*5)
+	for step := 1; step <= steps; step++ {
+		if step > 1 {
+			args = append(args, "sleep", pause)
+		}
+		frac := float64(step) / float64(steps)
+		args = append(args, "mousemove",
+			itoa(fromX+int(float64(x-fromX)*frac)), itoa(fromY+int(float64(y-fromY)*frac)))
+	}
+	return args
+}
+
+// parseMouseLocation reads X and Y from `xdotool getmouselocation --shell`.
+func parseMouseLocation(out string) (int, int, error) {
+	x, y := -1, -1
+	for line := range strings.Lines(out) {
+		key, val, ok := strings.Cut(strings.TrimSpace(line), "=")
+		if !ok {
+			continue
+		}
+		n, err := strconv.Atoi(val)
+		if err != nil {
+			continue
+		}
+		switch key {
+		case "X":
+			x = n
+		case "Y":
+			y = n
+		}
+	}
+	if x < 0 || y < 0 {
+		return 0, 0, fmt.Errorf("could not read the pointer position from xdotool: %q", out)
+	}
+	return x, y, nil
 }
 
 func (s *rdpSession) scroll(ctx context.Context, args arguments) (toolResult, error) {
@@ -784,29 +903,50 @@ func waitTool2(ctx context.Context, args arguments) (toolResult, error) {
 	return textResult("Waited %s", d), nil
 }
 
+// xdotoolKeyNames maps the agent's key names (namedKeys in platform_windows.go)
+// onto X keysyms, so a Shortcut means the same thing on either side.
+var xdotoolKeyNames = map[string]string{
+	"ctrl": "ctrl", "control": "ctrl", "alt": "alt", "shift": "shift",
+	"win": "super", "super": "super", "cmd": "super", "meta": "super",
+	"esc": "Escape", "escape": "Escape", "enter": "Return", "return": "Return",
+	"del": "Delete", "delete": "Delete", "ins": "Insert", "insert": "Insert",
+	"pageup": "Prior", "pagedown": "Next", "space": "space", "tab": "Tab",
+	"up": "Up", "down": "Down", "left": "Left", "right": "Right",
+	"home": "Home", "end": "End", "backspace": "BackSpace", "printscreen": "Print",
+	"capslock": "Caps_Lock", "numlock": "Num_Lock",
+	"volumemute": "XF86AudioMute", "volumedown": "XF86AudioLowerVolume", "volumeup": "XF86AudioRaiseVolume",
+}
+
 // xdotoolCombo maps a "ctrl+shift+esc" style string onto xdotool keysyms.
+// Keysyms are case-sensitive, so only the names above and single characters
+// are lowercased: "F4" and "f4" both become F4, and anything else passes
+// through as written, so a real keysym such as "KP_Enter" still works.
 func xdotoolCombo(raw string) string {
-	repl := map[string]string{
-		"win": "super", "cmd": "super", "meta": "super",
-		"esc": "Escape", "escape": "Escape", "enter": "Return", "return": "Return",
-		"del": "Delete", "delete": "Delete", "ins": "Insert", "insert": "Insert",
-		"pageup": "Prior", "pagedown": "Next", "space": "space", "tab": "Tab",
-		"up": "Up", "down": "Down", "left": "Left", "right": "Right",
-		"home": "Home", "end": "End", "backspace": "BackSpace", "printscreen": "Print",
-	}
 	var parts []string
 	for p := range strings.SplitSeq(raw, "+") {
-		k := strings.TrimSpace(strings.ToLower(p))
+		k := strings.TrimSpace(p)
 		if k == "" {
 			continue
 		}
-		if mapped, ok := repl[k]; ok {
-			parts = append(parts, mapped)
-		} else {
+		lower := strings.ToLower(k)
+		switch {
+		case xdotoolKeyNames[lower] != "":
+			parts = append(parts, xdotoolKeyNames[lower])
+		case isFunctionKey(lower):
+			parts = append(parts, strings.ToUpper(lower))
+		case len([]rune(k)) == 1:
+			parts = append(parts, lower)
+		default:
 			parts = append(parts, k)
 		}
 	}
 	return strings.Join(parts, "+")
+}
+
+// isFunctionKey reports whether k is f1..f24, the range the agent accepts.
+func isFunctionKey(k string) bool {
+	n, err := strconv.Atoi(strings.TrimPrefix(k, "f"))
+	return strings.HasPrefix(k, "f") && err == nil && n >= 1 && n <= 24 && k == "f"+strconv.Itoa(n)
 }
 
 // ── MCP registration + routing ───────────────────────────────────────────────
