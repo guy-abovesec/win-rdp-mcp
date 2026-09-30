@@ -60,18 +60,22 @@ nix run github:stubbedev/win-rdp-mcp -- control \
 export WIN_RDP_TARGET_PASS='...'
 ```
 
-That starts an MCP server on stdio. Point your client at it (below). The first
-system-tool call waits a few seconds while the agent bootstraps; the desktop
-tools work immediately.
+That starts an MCP server on stdio. Point your client at it (below). The RDP
+session opens on the first tool call, and reopens on its own if it drops —
+Windows gives a user one session, so another client logging in as the same user
+takes it. The first system-tool call waits a few seconds while the agent
+bootstraps; the desktop tools work immediately.
 
 ### Requirements (controller host)
 
-The controller shells out to `xfreerdp` (FreeRDP 3), `xdotool`, `import`
-(ImageMagick) and `Xvfb`. The Nix package and dev shell bundle them. Installing
-another way, get them from your package manager, e.g. on Debian/Ubuntu:
+The controller shells out to `xfreerdp` (FreeRDP 3 — `xfreerdp3` is used when
+present, which is what Debian and Ubuntu call it), `xdotool`, `import`
+(ImageMagick), `Xvfb` and `xdpyinfo`. The Nix package and dev shell bundle them.
+Installing another way, get them from your package manager, e.g. on
+Debian/Ubuntu:
 
 ```sh
-sudo apt install freerdp3-x11 xdotool imagemagick xvfb
+sudo apt install freerdp3-x11 xdotool imagemagick xvfb x11-utils
 ```
 
 The target account must be able to log in over RDP. That's it — no admin share,
@@ -152,7 +156,7 @@ extra-trusted-public-keys = default:9P4FePqHV1rGv5NDBun0GN26y83pcaaMr/NHZrxKaac=
 
 ```sh
 go install github.com/stubbedev/win-rdp-mcp@latest
-# then install xfreerdp3 / xdotool / imagemagick / xvfb yourself
+# then install xfreerdp3 / xdotool / imagemagick / xvfb / xdpyinfo yourself
 ```
 
 ### npm / npx
