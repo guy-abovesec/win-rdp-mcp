@@ -1,0 +1,9 @@
+.git
+node_modules
+dist
+result
+result-*
+/win-rdp-mcp
+/win-rdp-mcp.exe
+/win-rdp-mcp.toml
+.env

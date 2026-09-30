@@ -168,9 +168,27 @@ npx -y @stubbedev/win-rdp-mcp control --target ... --user ...
 Downloads the prebuilt binary for your platform on first run. You still need the
 runtime tools installed (the npm package doesn't bundle them).
 
+### Docker (macOS and Windows hosts)
+
+The controller only runs on Linux. From macOS or Windows, run it from the
+bundled [Dockerfile](Dockerfile): the image carries FreeRDP 3, Xvfb, xdotool
+and ImageMagick, and the agent to push.
+
+```sh
+docker build -t win-rdp-mcp https://github.com/stubbedev/win-rdp-mcp.git
+claude mcp add win-rdp -s user -- \
+  docker run -i --rm -v ~/.config/win-rdp-mcp/target.pass:/run/secrets/target.pass:ro \
+  win-rdp-mcp control --target 192.168.1.50 --user administrator \
+  --pass-file /run/secrets/target.pass
+```
+
+`-i` keeps stdin open for the stdio transport. The target must be reachable from
+inside the container.
+
 > Everything builds and tests on Linux, macOS and Windows — that is how CI checks
-> it — but the **controller runs on Linux** (it needs xfreerdp/xdotool), and the
-> **agent binary is for Windows**.
+> it — but the **controller runs on Linux** (it needs xfreerdp/xdotool; use
+> [Docker](#docker-macos-and-windows-hosts) elsewhere), and the **agent binary is
+> for Windows**.
 
 ---
 
