@@ -111,6 +111,16 @@ const bootstrapWait = 90 * time.Second
 
 // call relays one tool invocation to the agent and waits for its reply.
 func (p *agentProxy) call(ctx context.Context, name string, args map[string]any) (toolResult, error) {
+	// The agent is reached through the redirected drive, which exists only
+	// while the RDP client runs; this also opens the session (and starts the
+	// bootstrap) when a system tool is the first call.
+	p.session.mu.Lock()
+	err := p.session.ensureConnected(ctx)
+	p.session.mu.Unlock()
+	if err != nil {
+		return toolResult{}, err
+	}
+
 	if !p.ready() {
 		// Block on bootstrap instead of erroring: the AI's first system-tool
 		// call right after connect should just work, not have to be retried.
