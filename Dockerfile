@@ -17,9 +17,12 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /out/win-rdp-mcp . \
 
 FROM debian:trixie-slim
 # x11-utils provides xdpyinfo, the controller's display readiness probe.
+# netbase provides /etc/services, which FreeRDP's HTTPS client needs to resolve
+# the `https` port for the AAD discovery fetch (`/sec:aad`); without it that
+# lookup fails with HTTP_STATUS_UNKNOWN.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      freerdp3-x11 xvfb x11-utils xdotool imagemagick ca-certificates \
+      freerdp3-x11 xvfb x11-utils xdotool imagemagick ca-certificates netbase \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=build /out/ /usr/local/bin/
 ENTRYPOINT ["/usr/local/bin/win-rdp-mcp"]
