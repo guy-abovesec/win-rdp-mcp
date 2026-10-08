@@ -67,6 +67,8 @@ func controlMain(argv []string) error {
 		height      = fs.IntP("height", "H", 800, "session height in pixels")
 		agentExe    = fs.String("agent-exe", "", "path to the Windows agent binary to push (default: ./win-rdp-mcp.exe)")
 		noAgent     = fs.Bool("no-agent", false, "desktop tools only; do not push the in-session agent")
+		clientHost  = fs.String("client-hostname", "WORKSTATION", "RDP client hostname reported to the target; keep neutral so the session shows no operator tooling")
+		clipboard   = fs.Bool("clipboard", false, "enable clipboard redirection (off by default to avoid an operator-tooling footprint in the session)")
 		debug       = fs.BoolP("debug", "d", false, "log RDP and bootstrap detail to stderr")
 		enableAll   = fs.BoolP("enable-all", "a", false, "enable every tool, including destructive tier 3")
 		enableTier3 = fs.BoolP("enable-tier3", "3", false, "enable the destructive tier 3 tools")
@@ -115,6 +117,7 @@ func controlMain(argv []string) error {
 		host: *target, user: *user, domain: *domain, pass: pass,
 		width: *width, height: *height, debug: *debug,
 		rdpBin: rdpBin, life: ctx,
+		noAgent: *noAgent, clientHostname: *clientHost, clipboard: *clipboard,
 	}
 	defer sess.stop()
 
@@ -234,6 +237,14 @@ type rdpSession struct {
 	width, height            int
 	debug                    bool
 	rdpBin                   string // the FreeRDP client, from findControllerDeps
+
+	// Footprint controls. The "mcp" drive carries the in-session agent, so it is
+	// only redirected when the agent is enabled; clipboard redirection is off by
+	// default; and the client hostname is kept neutral — otherwise the target
+	// sees operator tooling (e.g. a registry "mcp on <client-host>" entry).
+	noAgent        bool
+	clientHostname string
+	clipboard      bool
 
 	// life bounds the process: the RDP client and background work started on
 	// connect outlive the tool call that triggered them.
@@ -366,9 +377,21 @@ func (s *rdpSession) clientArgs() []string {
 		"/p:" + s.pass,
 		"/cert:ignore", "/sec:nla",
 		fmt.Sprintf("/size:%dx%d", s.width, s.height),
-		"/drive:mcp," + s.workdir, // the file channel + agent delivery
-		"+clipboard",
 		"/log-level:" + logLevel(s.debug),
+	}
+	if s.clientHostname != "" {
+		args = append(args, "/client-hostname:"+s.clientHostname)
+	}
+	// Only redirect the "mcp" drive when the agent needs it; in --no-agent mode
+	// it would just surface operator tooling in the target (the "mcp on
+	// <client-host>" registry entry investigators flagged).
+	if !s.noAgent {
+		args = append(args, "/drive:mcp,"+s.workdir) // the file channel + agent delivery
+	}
+	if s.clipboard {
+		args = append(args, "+clipboard")
+	} else {
+		args = append(args, "-clipboard")
 	}
 	if s.domain != "" {
 		args = append(args, "/d:"+s.domain)
