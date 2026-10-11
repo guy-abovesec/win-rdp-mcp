@@ -20,9 +20,12 @@ FROM debian:trixie-slim
 # netbase provides /etc/services, which FreeRDP's HTTPS client needs to resolve
 # the `https` port for the AAD discovery fetch (`/sec:aad`); without it that
 # lookup fails with HTTP_STATUS_UNKNOWN.
+# x11vnc serves the session's headless Xvfb read-only for the Watch portal when
+# the controller is run with --vnc (off by default); the container publishes its
+# port on host loopback only.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      freerdp3-x11 xvfb x11-utils xdotool imagemagick ca-certificates netbase \
+      freerdp3-x11 xvfb x11-utils xdotool imagemagick ca-certificates netbase x11vnc \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=build /out/ /usr/local/bin/
 ENTRYPOINT ["/usr/local/bin/win-rdp-mcp"]

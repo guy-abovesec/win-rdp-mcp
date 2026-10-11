@@ -69,6 +69,7 @@ func controlMain(argv []string) error {
 		noAgent     = fs.Bool("no-agent", false, "desktop tools only; do not push the in-session agent")
 		clientHost  = fs.String("client-hostname", "WORKSTATION", "RDP client hostname reported to the target; keep neutral so the session shows no operator tooling")
 		clipboard   = fs.Bool("clipboard", false, "enable clipboard redirection (off by default to avoid an operator-tooling footprint in the session)")
+		vnc         = fs.Bool("vnc", false, "serve this session's headless display over a view-only VNC server (x11vnc on port 5900) for the Watch portal; off by default")
 		debug       = fs.BoolP("debug", "d", false, "log RDP and bootstrap detail to stderr")
 		enableAll   = fs.BoolP("enable-all", "a", false, "enable every tool, including destructive tier 3")
 		enableTier3 = fs.BoolP("enable-tier3", "3", false, "enable the destructive tier 3 tools")
@@ -118,6 +119,7 @@ func controlMain(argv []string) error {
 		width: *width, height: *height, debug: *debug,
 		rdpBin: rdpBin, life: ctx,
 		noAgent: *noAgent, clientHostname: *clientHost, clipboard: *clipboard,
+		vnc: *vnc,
 	}
 	defer sess.stop()
 
@@ -246,6 +248,13 @@ type rdpSession struct {
 	clientHostname string
 	clipboard      bool
 
+	// vnc, when set, serves this session's headless Xvfb over a view-only VNC
+	// server (x11vnc) so the Watch portal can mirror the desktop read-only.
+	// vncCmd is that process, started once on first connect and torn down with
+	// the session.
+	vnc    bool
+	vncCmd *exec.Cmd
+
 	// life bounds the process: the RDP client and background work started on
 	// connect outlive the tool call that triggered them.
 	life context.Context
@@ -338,6 +347,11 @@ func (s *rdpSession) startDisplay(ctx context.Context) error {
 		return err
 	}
 	s.xvfb = xvfb
+	// Attach the Watch viewer to the display as soon as it exists — before the
+	// RDP connect — so the viewer mirrors the session from the start (connect,
+	// logon, then the live desktop). The display outlives any one xfreerdp, so
+	// this runs exactly once; -forever keeps x11vnc serving across reconnects.
+	s.startVNC(ctx)
 	return nil
 }
 
@@ -400,6 +414,10 @@ func (s *rdpSession) clientArgs() []string {
 }
 
 func (s *rdpSession) stop() {
+	if s.vncCmd != nil && s.vncCmd.Process != nil {
+		s.vncCmd.Process.Kill()
+		s.vncCmd.Wait()
+	}
 	if s.client != nil {
 		s.client.kill()
 	}
@@ -410,6 +428,55 @@ func (s *rdpSession) stop() {
 	if s.workdir != "" {
 		os.RemoveAll(s.workdir)
 	}
+}
+
+// vncPort is the port x11vnc listens on inside the controller. One session per
+// controller process, so a fixed port is fine; when the controller runs in a
+// container, that container publishes this port to a unique host loopback port
+// (see the control-profile), which is what keeps exposure loopback-only.
+const vncPort = 5900
+
+// startVNC serves this session's headless Xvfb over a view-only VNC server so
+// the Watch portal can mirror the desktop read-only. x11vnc attaches to the same
+// X display xfreerdp draws into; -viewonly makes it strictly read-only (no input
+// reaches the session), matching the portal's noVNC viewOnly client, and -nopw
+// is safe because the only ingress is the host-loopback port mapping behind the
+// portal's token auth.
+//
+// It is deliberately NOT given -localhost. When the controller runs in a
+// container, Docker publishes a port by DNAT to the container's bridge
+// interface (not its loopback), so an x11vnc bound only to 127.0.0.1 inside the
+// container would make the published port unreachable. Loopback-only exposure is
+// enforced host-side by `docker run -p 127.0.0.1:<port>:5900`; the container
+// network is otherwise isolated, so binding all interfaces inside it adds no
+// reachable surface.
+//
+// A failure here never fails the session — the desktop tools must keep working
+// even with no Watch viewer.
+func (s *rdpSession) startVNC(ctx context.Context) {
+	if !s.vnc || s.vncCmd != nil {
+		return
+	}
+	if _, err := exec.LookPath("x11vnc"); err != nil {
+		logf("--vnc requested but x11vnc is not installed; session runs without the Watch viewer: %v", err)
+		return
+	}
+	cmd := exec.Command("x11vnc",
+		"-display", s.display,
+		"-rfbport", strconv.Itoa(vncPort),
+		"-viewonly", "-shared", "-forever", "-nopw",
+		"-quiet",
+	)
+	cmd.Env = append(os.Environ(), "DISPLAY="+s.display)
+	if s.debug {
+		cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
+	}
+	if err := cmd.Start(); err != nil {
+		logf("starting x11vnc failed (session still works, no Watch viewer): %v", err)
+		return
+	}
+	s.vncCmd = cmd
+	logf("x11vnc view-only server up on :%d for display %s", vncPort, s.display)
 }
 
 func logLevel(debug bool) string {
